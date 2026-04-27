@@ -126,6 +126,7 @@ class MeloGenerator:
         max_retries: int = 3,
         retry_delay: float = 2.0,
         allowed_musical_names: Optional[list[str]] = None,
+        exclude_user_mentioned: bool = True,
     ):
         self.llm = llm
         self.model_name = getattr(llm, 'model_name', 'unknown')
@@ -135,6 +136,7 @@ class MeloGenerator:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.allowed_musical_names = allowed_musical_names or []
+        self.exclude_user_mentioned = exclude_user_mentioned
         self._allowed_name_map = {
             self._normalize_name(name): name for name in self.allowed_musical_names if self._normalize_name(name)
         }
@@ -233,13 +235,24 @@ class MeloGenerator:
             else:
                 logger.warning(f"Invalid recommendation entry skipped: {rec}")
 
+        # Exclude musicals explicitly mentioned by user input/preferences.
+        if self.exclude_user_mentioned and valid_recs:
+            mentioned = self._build_user_mentioned_set(user)
+            before = len(valid_recs)
+            valid_recs = self._exclude_user_mentioned(valid_recs, mentioned)
+            if len(valid_recs) < before:
+                logger.info(f"Filtered {before - len(valid_recs)} user-mentioned recommendations.")
+
         if not valid_recs:
             # Fallback: use retrieved KB candidates to keep outputs in-KB.
             kb_fallback = []
+            mentioned = self._build_user_mentioned_set(user)
             for entry, _score in retrieved.get("kb_entries", []):
                 name = entry.get("name", "")
                 canonical = self._canonicalize_to_allowed_name(name)
                 if not canonical:
+                    continue
+                if self.exclude_user_mentioned and self._normalize_name(canonical) in mentioned:
                     continue
                 kb_fallback.append(
                     {
@@ -274,6 +287,29 @@ class MeloGenerator:
         s = re.sub(r"[^a-z0-9\u4e00-\u9fff\s]", "", s)
         s = re.sub(r"\s+", " ", s).strip()
         return s
+
+    def _build_user_mentioned_set(self, user: dict) -> set[str]:
+        ignored = {"用户正向偏好", "用户回避偏好"}
+        out: set[str] = set()
+        for item in user.get("likes", []) + user.get("dislikes", []):
+            raw = str(item.get("musical", "")).strip()
+            if not raw or raw in ignored:
+                continue
+            n = self._normalize_name(raw)
+            if n:
+                out.add(n)
+        return out
+
+    def _exclude_user_mentioned(self, recs: list[dict], mentioned: set[str]) -> list[dict]:
+        if not mentioned:
+            return recs
+        out = []
+        for rec in recs:
+            n = self._normalize_name(str(rec.get("musical", "")))
+            if n and n in mentioned:
+                continue
+            out.append(rec)
+        return out
 
     def _canonicalize_to_allowed_name(self, name: str) -> Optional[str]:
         if not self._allowed_name_map:

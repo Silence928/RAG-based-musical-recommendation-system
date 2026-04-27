@@ -75,7 +75,7 @@ generation:
   # Generation parameters — 0.0 for reproducible experiments
   temperature: 0.0
   max_tokens: 1024
-  num_recommendations: 5  # recommend top-n musicals
+  num_recommendations: 15  # initial recommendation candidates for reranking
   # NLI post-retrieval filter (ARAG-inspired)
   nli_filter:
     enabled: true
@@ -126,7 +126,13 @@ post_rank:
     quality_weight: 0.7
     rarity_weight: 0.3
     neg_penalty: 0.4
+    # User-direction term:
+    # user_term = lambda_like*like_co_norm - lambda_dislike*dislike_co_norm
+    lambda_like: 1.0
+    lambda_dislike: 1.2
     # Final blend:
-    # final = base_rank_weight*model_rank + prior_weight*prior_score
-    base_rank_weight: 0.6
-    prior_weight: 0.4
+    # final = base_rank_weight*model_rank + prior_weight*prior_score + user_term_weight*user_term
+    base_rank_weight: 0.55
+    prior_weight: 0.20
+    user_term_weight: 0.25
+    final_top_n: 10  # final recommendations after reranking

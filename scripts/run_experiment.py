@@ -44,6 +44,7 @@ from src.llm_backend import create_llm, load_model_and_tokenizer
 from src.domain_lexicon import load_domain_lexicon
 from src.post_rank.global_prior import (
     build_global_quality_priors,
+    build_user_preference_maps,
     rerank_with_global_priors,
 )
 
@@ -108,7 +109,8 @@ def main():
 
     # Load data
     processed = config["paths"]["processed_data"]
-    users = load_jsonl(f"{processed}/users.jsonl")
+    all_users = load_jsonl(f"{processed}/users.jsonl")
+    users = list(all_users)
     kb_entries = load_knowledge_base(
         str(Path(config["paths"]["knowledge_base"]) / "musicals.jsonl")
     )
@@ -120,6 +122,8 @@ def main():
         logger.info(f"Subsampled to {len(users)} users (stratified)")
     else:
         logger.info(f"{len(users)} users loaded")
+
+    user_like_map, user_dislike_map = build_user_preference_maps(all_users)
 
     # Save run metadata for reproducibility
     save_run_metadata(str(run_dir), config, extra={
@@ -226,8 +230,12 @@ def main():
     prior_quality_weight = float(prior_cfg.get("quality_weight", 0.7))
     prior_rarity_weight = float(prior_cfg.get("rarity_weight", 0.3))
     prior_neg_penalty = float(prior_cfg.get("neg_penalty", 0.4))
-    prior_base_rank_weight = float(prior_cfg.get("base_rank_weight", 0.6))
-    prior_blend_weight = float(prior_cfg.get("prior_weight", 0.4))
+    prior_base_rank_weight = float(prior_cfg.get("base_rank_weight", 0.55))
+    prior_blend_weight = float(prior_cfg.get("prior_weight", 0.20))
+    prior_user_term_weight = float(prior_cfg.get("user_term_weight", 0.25))
+    prior_lambda_like = float(prior_cfg.get("lambda_like", 1.0))
+    prior_lambda_dislike = float(prior_cfg.get("lambda_dislike", 1.2))
+    final_top_n = int(prior_cfg.get("final_top_n", 10))
     global_priors = {}
     if prior_enabled:
         global_priors = build_global_quality_priors(
@@ -241,6 +249,9 @@ def main():
         logger.info(
             "Global-prior rerank enabled "
             f"(base={prior_base_rank_weight:.2f}, prior={prior_blend_weight:.2f}, "
+            f"user_term={prior_user_term_weight:.2f}, "
+            f"lambda_like={prior_lambda_like:.2f}, lambda_dislike={prior_lambda_dislike:.2f}, "
+            f"final_top_n={final_top_n}, "
             f"quality={prior_quality_weight:.2f}, rarity={prior_rarity_weight:.2f}, "
             f"neg_penalty={prior_neg_penalty:.2f})"
         )
@@ -307,7 +318,14 @@ def main():
                         global_priors,
                         base_rank_weight=prior_base_rank_weight,
                         prior_weight=prior_blend_weight,
+                        user_term_weight=prior_user_term_weight,
+                        retrieved=retrieved,
+                        user_like_map=user_like_map,
+                        user_dislike_map=user_dislike_map,
+                        lambda_like=prior_lambda_like,
+                        lambda_dislike=prior_lambda_dislike,
                     )
+                output["recommendations"] = output.get("recommendations", [])[:final_top_n]
 
                 condition_results.append({
                     "user": user,
@@ -375,7 +393,14 @@ def main():
                         global_priors,
                         base_rank_weight=prior_base_rank_weight,
                         prior_weight=prior_blend_weight,
+                        user_term_weight=prior_user_term_weight,
+                        retrieved=empty_retrieved,
+                        user_like_map=user_like_map,
+                        user_dislike_map=user_dislike_map,
+                        lambda_like=prior_lambda_like,
+                        lambda_dislike=prior_lambda_dislike,
                     )
+                output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                 baseline_results.append({
                     "user": user,
                     "held_out": held_out,
@@ -439,7 +464,14 @@ def main():
                                     global_priors,
                                     base_rank_weight=prior_base_rank_weight,
                                     prior_weight=prior_blend_weight,
+                                    user_term_weight=prior_user_term_weight,
+                                    retrieved=retrieved,
+                                    user_like_map=user_like_map,
+                                    user_dislike_map=user_dislike_map,
+                                    lambda_like=prior_lambda_like,
+                                    lambda_dislike=prior_lambda_dislike,
                                 )
+                            output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                             cond_results.append({
                                 "user": user,
                                 "held_out": held_out,
@@ -501,7 +533,14 @@ def main():
                                 global_priors,
                                 base_rank_weight=prior_base_rank_weight,
                                 prior_weight=prior_blend_weight,
+                                user_term_weight=prior_user_term_weight,
+                                retrieved=retrieved,
+                                user_like_map=user_like_map,
+                                user_dislike_map=user_dislike_map,
+                                lambda_like=prior_lambda_like,
+                                lambda_dislike=prior_lambda_dislike,
                             )
+                        output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                         cond_results.append({
                             "user": user,
                             "held_out": held_out,

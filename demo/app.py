@@ -14,13 +14,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import gradio as gr
 
-from src.utils import load_config
+from src.utils import load_config, load_jsonl
 from src.llm_backend import create_llm
 from src.retrieval.indexer import PreferenceIndex, KnowledgeBaseIndex
 from src.retrieval.retriever import MeloRetriever
 from src.generation.generator import MeloGenerator
 from src.post_rank.global_prior import (
     build_global_quality_priors,
+    build_user_preference_maps,
     normalize_musical_name,
     rerank_with_global_priors,
 )
@@ -66,6 +67,7 @@ def load_resources():
     )
 
     prior_cfg = config.get("post_rank", {}).get("global_prior", {})
+    final_top_n = int(prior_cfg.get("final_top_n", 10))
     global_priors = build_global_quality_priors(
         pos_records=pos_index.records,
         neg_records=neg_index.records,
@@ -74,8 +76,11 @@ def load_resources():
         rarity_weight=float(prior_cfg.get("rarity_weight", 0.3)),
         neg_penalty=float(prior_cfg.get("neg_penalty", 0.4)),
     )
+    users_path = Path(config["paths"]["processed_data"]) / "users.jsonl"
+    users_data = load_jsonl(str(users_path))
+    user_like_map, user_dislike_map = build_user_preference_maps(users_data)
 
-    return config, retriever, generator, allowed_names, global_priors
+    return config, retriever, generator, allowed_names, global_priors, user_like_map, user_dislike_map
 
 
 # ======================== Core Logic ========================
@@ -197,15 +202,65 @@ def _format_evidence_quotes(rec: dict, fallback_evidence: list[str]) -> str:
     return "；".join([f"“{q}”" for q in quotes])
 
 
-def _collect_retrieval_evidence(retrieved: dict, limit: int = 4) -> list[str]:
-    evidences: list[str] = []
-    for record, _score in retrieved.get("positive_pairs", []):
+def _build_evidence_bank(retrieved: dict, limit_per_musical: int = 3) -> dict[str, list[dict]]:
+    """
+    Evidence grouped by musical, built from retrieved neighbors.
+    Keep full reason text (no truncation) for better readability.
+    """
+    bank: dict[str, list[dict]] = {}
+    all_pairs = (retrieved.get("positive_pairs", []) or []) + (retrieved.get("negative_pairs", []) or [])
+    for record, _score in all_pairs:
+        musical = str(record.get("musical", "")).strip()
         reason = str(record.get("reason", "")).strip()
-        if reason:
-            evidences.append(reason[:80])
-        if len(evidences) >= limit:
-            break
-    return evidences
+        if not musical or not reason:
+            continue
+        key = _normalize_name(musical)
+        bucket = bank.setdefault(key, [])
+        if len(bucket) >= limit_per_musical:
+            continue
+        bucket.append({"musical": musical, "reason": reason})
+    return bank
+
+
+def _collect_global_evidence(evidence_bank: dict[str, list[dict]], limit: int = 5) -> list[dict]:
+    merged: list[dict] = []
+    for items in evidence_bank.values():
+        for item in items:
+            merged.append(item)
+            if len(merged) >= limit:
+                return merged
+    return merged
+
+
+def _evidence_for_musical(musical: str, evidence_bank: dict[str, list[dict]], fallback_pool: list[dict]) -> list[str]:
+    key = _normalize_name(musical)
+    items = evidence_bank.get(key, [])
+    if items:
+        return [x["reason"] for x in items[:2]]
+    return [x["reason"] for x in fallback_pool[:2]]
+
+
+def _is_generic_fallback_reason(reason: str) -> bool:
+    return "基于检索到的知识库候选进行回退推荐" in (reason or "")
+
+
+def _make_non_template_reason(rec: dict, evidence_for_this_musical: list[str], user: dict) -> str:
+    """
+    Replace generic fallback reason with a user-aware, evidence-grounded explanation.
+    """
+    raw_reason = str(rec.get("reason", "")).strip()
+    if raw_reason and not _is_generic_fallback_reason(raw_reason):
+        return raw_reason
+
+    lead = evidence_for_this_musical[0].strip() if evidence_for_this_musical else ""
+    if lead:
+        return f"结合相似用户的真实评论，这部剧在你关注的情感共鸣与剧情表达上更贴合。参考片段：{lead}"
+
+    likes = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical")]
+    dislikes = [x.get("musical", "") for x in user.get("dislikes", []) if x.get("musical")]
+    if likes or dislikes:
+        return "该剧与您的喜欢/避雷方向整体更一致，并在检索结果中综合得分更高。"
+    return "该剧在当前检索候选中的综合得分较高。"
 
 
 def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> str:
@@ -223,25 +278,28 @@ def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> s
     lines.append("")
     lines.append("已根据你的描述生成推荐（已加入全局质量权重重排）：")
 
-    fallback_evidence = _collect_retrieval_evidence(retrieved)
+    evidence_bank = _build_evidence_bank(retrieved)
+    fallback_pool = _collect_global_evidence(evidence_bank)
     for idx, rec in enumerate(recs, start=1):
         musical = rec.get("musical", "未知剧目")
-        reason = rec.get("reason", "").strip() or "（无理由）"
-        evidence = _format_evidence_quotes(rec, fallback_evidence)
+        per_musical_evidence = _evidence_for_musical(musical, evidence_bank, fallback_pool)
+        reason = _make_non_template_reason(rec, per_musical_evidence, user)
+        evidence = _format_evidence_quotes(rec, per_musical_evidence)
         quality = rec.get("_prior_quality", 0.5)
         mentions = rec.get("_prior_mentions", 0)
+        user_term = rec.get("_user_term", 0.0)
         lines.append(f"{idx}. {musical}")
         lines.append(f"   推荐理由：{reason}")
         lines.append(f"   真实评论证据：{evidence}")
         lines.append(
-            f"   质量先验：quality={quality:.2f}, mentions={mentions}, final={rec.get('_rerank_score', 0.0):.2f}"
+            f"   打分分解：quality={quality:.2f}, mentions={mentions}, user_term={user_term:.2f}, final={rec.get('_rerank_score', 0.0):.2f}"
         )
 
-    if fallback_evidence:
+    if fallback_pool:
         lines.append("")
         lines.append("检索到的相似用户真实评论片段（节选）：")
-        for quote in fallback_evidence[:3]:
-            lines.append(f"- {quote}")
+        for item in fallback_pool[:4]:
+            lines.append(f"- [{item.get('musical', '未知剧目')}] {item.get('reason', '')}")
     return "\n".join(lines)
 
 
@@ -254,7 +312,7 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
     if RESOURCES is None:
         raise RuntimeError("Demo resources are not initialized. Please restart demo/app.py.")
 
-    config, retriever, generator, allowed_names, global_priors = RESOURCES
+    config, retriever, generator, allowed_names, global_priors, user_like_map, user_dislike_map = RESOURCES
     user = _build_demo_user_from_text(text, allowed_names)
     top_k = config["retrieval"]["default_top_k"]
     kb_top_m = config["retrieval"]["kb_top_m"]
@@ -273,10 +331,17 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
         output["recommendations"] = rerank_with_global_priors(
             output.get("recommendations", []),
             global_priors,
-            base_rank_weight=float(prior_cfg.get("base_rank_weight", 0.6)),
-            prior_weight=float(prior_cfg.get("prior_weight", 0.4)),
+            base_rank_weight=float(prior_cfg.get("base_rank_weight", 0.55)),
+            prior_weight=float(prior_cfg.get("prior_weight", 0.20)),
+            user_term_weight=float(prior_cfg.get("user_term_weight", 0.25)),
+            retrieved=retrieved,
+            user_like_map=user_like_map,
+            user_dislike_map=user_dislike_map,
+            lambda_like=float(prior_cfg.get("lambda_like", 1.0)),
+            lambda_dislike=float(prior_cfg.get("lambda_dislike", 1.2)),
             attach_debug_fields=True,
         )
+        output["recommendations"] = output.get("recommendations", [])[:final_top_n]
         reply = _format_recommendation_reply(output, retrieved, user)
     except Exception as e:
         reply = f"推荐流程出错：{e}"
