@@ -1,0 +1,132 @@
+# ======================== MeloMatch Configuration ========================
+
+project:
+  name: "MeloMatch"
+  version: "0.1.0"
+
+# ----- Paths -----
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  knowledge_base: "data/knowledge_base"
+  index_dir: "data/indices"
+  results_dir: "results"
+
+# ----- Data -----
+data:
+  # Expected questionnaire export format: csv or json
+  format: "csv"
+  # Number of liked/disliked musicals per respondent
+  likes_per_user: 3
+  dislikes_per_user: 3
+  # Hold-out strategy for evaluation
+  holdout: 1  # hold out 1 liked musical per user
+
+# ----- Retrieval -----
+retrieval:
+  # Embedding model for dense retrieval (alternatives: BAAI/bge-base-zh-v1.5, thenlper/gte-base-zh)
+  embedding_model: "BAAI/bge-base-zh-v1.5"
+  embedding_dim: 768
+  # BM25 parameters
+  bm25:
+    k1: 1.5
+    b: 0.75
+  # Dense retrieval
+  dense:
+    similarity: "cosine"
+  # Hybrid: Reciprocal Rank Fusion
+  hybrid:
+    rrf_k: 60  # RRF constant
+  # Number of preference pairs to retrieve
+  top_k_options: [1, 3, 5, 10]
+  default_top_k: 5
+  # Number of KB entries to retrieve for grounding
+  kb_top_m: 10
+  # Contrastive re-ranking (Seshadri-inspired)
+  contrastive_rerank:
+    enabled: true
+    alpha: 0.3  # Weight for negative centroid penalty (0.2-0.5 per Seshadri et al.)
+
+# ----- Generation -----
+generation:
+  # LLM backbones
+  models:
+    zero_shot:
+      name: "Qwen/Qwen3-14B"
+      backend: "vllm"  # "vllm", "local", or "api"
+      enable_thinking: false
+      dtype: "bfloat16"  # A100 supports bf16 natively; no quantization needed
+      tensor_parallel_size: 1
+      max_model_len: 4096
+      gpu_memory_utilization: 0.90
+      # API fallback (uncomment to use API instead of local):
+      # backend: "api"
+      # api_base: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      # api_key: null  # set DASHSCOPE_API_KEY env var
+    fine_tuned:
+      name: "Qwen/Qwen3-8B"
+      backend: "vllm"
+      enable_thinking: false
+      dtype: "float16"  # T4 does not support bf16
+      tensor_parallel_size: 2  # Kaggle T4×2
+      max_model_len: 4096
+      gpu_memory_utilization: 0.90
+      lora_checkpoint: null  # path to QLoRA adapter weights (not supported with vllm yet)
+  # Generation parameters — 0.0 for reproducible experiments
+  temperature: 0.0
+  max_tokens: 1024
+  num_recommendations: 5  # recommend top-n musicals
+  # NLI post-retrieval filter (ARAG-inspired)
+  nli_filter:
+    enabled: true
+    threshold: 0.6  # candidates scoring above this are filtered
+  # Structured preference profiling (DiscomfortFilter-inspired)
+  preference_profile:
+    enabled: true
+    use_llm: true  # false = rule-based fallback (no API cost)
+
+# ----- Evaluation -----
+evaluation:
+  hit_k: [1, 3, 5]
+  avoidance_k: [3, 5]
+  # Soft match: musicals sharing >= threshold genre/theme tags with disliked
+  soft_match_tag_threshold: 2
+  # Human evaluation
+  human_eval:
+    num_evaluators: 15
+    faithfulness_scale: [1, 2, 3, 4, 5]
+
+# ----- Experiment -----
+experiment:
+  signals: ["dual_enhanced"]
+  methods: ["dense"]
+  backbones: ["zero_shot"]
+  # Data scaling ablation
+  user_subsets: [25, 50, 100]
+  seed: 42
+
+# ----- Text Expansion -----
+text_expansion:
+  domain_lexicon:
+    enabled: true
+    # mode:
+    # - prompt_context: keep raw text unchanged; attach glossary context to prompt (recommended)
+    # - inline_expand: append term explanations into text before indexing/retrieval
+    # - lookup_only: no text rewrite; only do runtime glossary lookup for prompt
+    mode: "prompt_context"
+    path: "data/raw/domain_lexicon.json"
+    max_expansions_per_text: 3
+
+# ----- Post Ranking -----
+post_rank:
+  global_prior:
+    enabled: true
+    # Prior formula:
+    # prior_score = quality_weight*quality + rarity_weight*rarity_bonus - neg_penalty*neg_bias
+    quality_weight: 0.7
+    rarity_weight: 0.3
+    neg_penalty: 0.4
+    # Final blend:
+    # final = base_rank_weight*model_rank + prior_weight*prior_score
+    base_rank_weight: 0.6
+    prior_weight: 0.4

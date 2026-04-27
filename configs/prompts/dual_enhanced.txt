@@ -1,0 +1,35 @@
+## 你的偏好
+**你喜欢的音乐剧：**
+{user_likes}
+
+**你不喜欢的音乐剧：**
+{user_dislikes}
+
+## 结构化规避画像
+{avoidance_profile}
+
+## 用户画像（硬偏好，作为软约束）
+{user_profile_summary}
+
+## 相似用户偏好
+口味相近的用户还喜欢：
+{retrieved_positive}
+
+雷点相近的用户也不喜欢：
+{retrieved_negative}
+**请尽量避开这些特征。**
+
+## 音乐剧知识库
+{kb_context}
+
+## 任务
+请用中文推荐 {n} 部我未提到过的音乐剧。
+- 必须尽量规避“结构化规避画像”中提到的特征；
+- 每一部都要说明为什么符合我的偏好、以及为什么避开了我的雷点；
+- 尽量结合知识库中的语言/剧场等标签给出依据；
+- 每一部必须提供 `evidence_quotes` 字段，引用“已提供上下文”中的原句短片段作为证据；
+- 严禁编造证据：如果找不到可引用的原句，`evidence_quotes` 必须返回空数组 `[]`；
+- 不要把用户原始中文表达翻译成英文后再改写。
+
+仅返回 JSON 数组：
+[{{"musical": "Name", "reason": "Why this fits your taste and avoids...", "evidence_quotes": ["证据短句1", "证据短句2"]}}]

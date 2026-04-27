@@ -1,0 +1,31 @@
+# MeloMatch — CSC5051 Final Project
+# Core
+transformers>=4.49.0
+accelerate>=1.2.1
+torch>=2.0.0
+bitsandbytes>=0.45.2
+peft>=0.14.0
+vllm>=0.8.0
+
+# Retrieval
+sentence-transformers>=3.3.1
+faiss-cpu>=1.9.0
+rank-bm25>=0.2.2
+jieba>=0.42.1
+
+# Generation & Utils
+pyyaml
+tqdm
+numpy
+
+# Evaluation & Visualization
+matplotlib
+seaborn
+scipy
+pandas
+
+# Demo
+gradio
+
+# Testing
+pytest

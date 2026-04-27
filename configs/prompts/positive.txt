@@ -1,0 +1,17 @@
+## 你的偏好
+**你喜欢的音乐剧：**
+{user_likes}
+
+## 相似用户偏好
+口味相近的用户还喜欢：
+{retrieved_positive}
+
+## 音乐剧知识库
+{kb_context}
+
+## 任务
+请用中文推荐 {n} 部我未提到过的音乐剧，并说明每一部为什么符合我的偏好。
+不要把用户原始中文表达翻译成英文后再改写。
+
+仅返回 JSON 数组：
+[{{"musical": "Name", "reason": "Why this fits your taste based on..."}}]

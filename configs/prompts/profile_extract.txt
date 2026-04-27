@@ -1,0 +1,16 @@
+请分析以下“用户不喜欢音乐剧”的文本，并提取结构化的规避维度。
+
+不喜欢条目：
+{dislike_entries}
+
+请把“用户想规避的点”提取到以下字段：
+- avoid_genres: 想规避的音乐剧类型/流派（如“点唱机音乐剧”“revue”“舞蹈占比过高”）
+- avoid_themes: 想规避的主题内容（如“浅层恋爱”“说教感强”）
+- avoid_styles: 想规避的呈现方式/结构风格（如“形式大于内容”“叙事过于跳跃”）
+- avoid_elements: 想规避的具体元素（如“剧情不连贯”“编舞堆砌”）
+- tolerance_notes: 在某些条件下可接受的点（结合上下文推断）
+
+请尽量精确，只保留文本中有明确依据的信息，不要臆造。
+
+请使用中文理解，但仅返回一个 JSON 对象：
+{{"avoid_genres": [...], "avoid_themes": [...], "avoid_styles": [...], "avoid_elements": [...], "tolerance_notes": [...]}}
