@@ -80,7 +80,16 @@ def load_resources():
     users_data = load_jsonl(str(users_path))
     user_like_map, user_dislike_map = build_user_preference_maps(users_data)
 
-    return config, retriever, generator, allowed_names, global_priors, user_like_map, user_dislike_map
+    return (
+        config,
+        retriever,
+        generator,
+        allowed_names,
+        global_priors,
+        user_like_map,
+        user_dislike_map,
+        final_top_n,
+    )
 
 
 # ======================== Core Logic ========================
@@ -198,7 +207,7 @@ def _format_evidence_quotes(rec: dict, fallback_evidence: list[str]) -> str:
         quotes = quotes[:2]
 
     if not quotes:
-        return "（未返回可用证据）"
+        return "（未命中该剧的直接用户评论证据）"
     return "；".join([f"“{q}”" for q in quotes])
 
 
@@ -232,12 +241,12 @@ def _collect_global_evidence(evidence_bank: dict[str, list[dict]], limit: int = 
     return merged
 
 
-def _evidence_for_musical(musical: str, evidence_bank: dict[str, list[dict]], fallback_pool: list[dict]) -> list[str]:
+def _evidence_for_musical(musical: str, evidence_bank: dict[str, list[dict]]) -> list[str]:
     key = _normalize_name(musical)
     items = evidence_bank.get(key, [])
     if items:
         return [x["reason"] for x in items[:2]]
-    return [x["reason"] for x in fallback_pool[:2]]
+    return []
 
 
 def _is_generic_fallback_reason(reason: str) -> bool:
@@ -256,7 +265,7 @@ def _make_non_template_reason(rec: dict, evidence_for_this_musical: list[str], u
     if lead:
         return f"结合相似用户的真实评论，这部剧在你关注的情感共鸣与剧情表达上更贴合。参考片段：{lead}"
 
-    likes = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical")]
+    likes = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical") and x.get("musical") not in ("用户正向偏好", "偏好描述")]
     dislikes = [x.get("musical", "") for x in user.get("dislikes", []) if x.get("musical")]
     if likes or dislikes:
         return "该剧与您的喜欢/避雷方向整体更一致，并在检索结果中综合得分更高。"
@@ -268,8 +277,16 @@ def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> s
     if not recs:
         return "暂时没有生成有效推荐，请换一种表达再试一次。"
 
-    likes = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical")]
-    dislikes = [x.get("musical", "") for x in user.get("dislikes", []) if x.get("musical")]
+    likes = [
+        x.get("musical", "")
+        for x in user.get("likes", [])
+        if x.get("musical") and x.get("musical") not in ("用户正向偏好", "偏好描述")
+    ]
+    dislikes = [
+        x.get("musical", "")
+        for x in user.get("dislikes", [])
+        if x.get("musical") and x.get("musical") != "用户回避偏好"
+    ]
 
     lines = []
     lines.append("我先提取到你的偏好：")
@@ -282,7 +299,7 @@ def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> s
     fallback_pool = _collect_global_evidence(evidence_bank)
     for idx, rec in enumerate(recs, start=1):
         musical = rec.get("musical", "未知剧目")
-        per_musical_evidence = _evidence_for_musical(musical, evidence_bank, fallback_pool)
+        per_musical_evidence = _evidence_for_musical(musical, evidence_bank)
         reason = _make_non_template_reason(rec, per_musical_evidence, user)
         evidence = _format_evidence_quotes(rec, per_musical_evidence)
         quality = rec.get("_prior_quality", 0.5)
@@ -312,7 +329,16 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
     if RESOURCES is None:
         raise RuntimeError("Demo resources are not initialized. Please restart demo/app.py.")
 
-    config, retriever, generator, allowed_names, global_priors, user_like_map, user_dislike_map = RESOURCES
+    (
+        config,
+        retriever,
+        generator,
+        allowed_names,
+        global_priors,
+        user_like_map,
+        user_dislike_map,
+        final_top_n,
+    ) = RESOURCES
     user = _build_demo_user_from_text(text, allowed_names)
     top_k = config["retrieval"]["default_top_k"]
     kb_top_m = config["retrieval"]["kb_top_m"]

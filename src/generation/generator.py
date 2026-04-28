@@ -254,10 +254,12 @@ class MeloGenerator:
                     continue
                 if self.exclude_user_mentioned and self._normalize_name(canonical) in mentioned:
                     continue
+                evidence_quotes = self._collect_candidate_evidence(canonical, retrieved, max_quotes=2)
                 kb_fallback.append(
                     {
                         "musical": canonical,
-                        "reason": "基于检索到的知识库候选进行回退推荐（模型原始输出不可用）。",
+                        "reason": self._build_kb_fallback_reason(canonical, entry, user),
+                        "evidence_quotes": evidence_quotes,
                     }
                 )
                 if len(kb_fallback) >= self.n:
@@ -289,7 +291,7 @@ class MeloGenerator:
         return s
 
     def _build_user_mentioned_set(self, user: dict) -> set[str]:
-        ignored = {"用户正向偏好", "用户回避偏好"}
+        ignored = {"用户正向偏好", "用户回避偏好", "偏好描述"}
         out: set[str] = set()
         for item in user.get("likes", []) + user.get("dislikes", []):
             raw = str(item.get("musical", "")).strip()
@@ -310,6 +312,44 @@ class MeloGenerator:
                 continue
             out.append(rec)
         return out
+
+    def _collect_candidate_evidence(self, candidate_name: str, retrieved: dict, max_quotes: int = 2) -> list[str]:
+        key = self._normalize_name(candidate_name)
+        quotes: list[str] = []
+        for bucket in ("positive_pairs", "negative_pairs"):
+            for record, _score in retrieved.get(bucket, []) or []:
+                m = self._normalize_name(str(record.get("musical", "")))
+                if m != key:
+                    continue
+                reason = str(record.get("reason", "")).strip()
+                if reason:
+                    quotes.append(reason)
+                if len(quotes) >= max_quotes:
+                    return quotes
+        return quotes
+
+    def _build_kb_fallback_reason(self, candidate_name: str, kb_entry: dict, user: dict) -> str:
+        parts: list[str] = []
+        lang = kb_entry.get("language_type")
+        fmt = kb_entry.get("format")
+        tradition = kb_entry.get("tradition")
+        if lang:
+            parts.append(f"语言类型为{lang}")
+        if fmt:
+            parts.append(f"形式为{fmt}")
+        if tradition:
+            parts.append(f"风格倾向{tradition}")
+
+        likes = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical") and x.get("musical") != "偏好描述"]
+        dislikes = [x.get("musical", "") for x in user.get("dislikes", []) if x.get("musical")]
+        if likes:
+            parts.append(f"与您提到喜欢的作品（如{likes[0]}）在偏好方向上更接近")
+        if dislikes:
+            parts.append("并尽量避开您明确不喜欢的叙事取向")
+
+        if not parts:
+            return f"{candidate_name}在检索候选中的综合匹配度较高。"
+        return f"{candidate_name}推荐给你的原因：{'；'.join(parts)}。"
 
     def _canonicalize_to_allowed_name(self, name: str) -> Optional[str]:
         if not self._allowed_name_map:

@@ -74,8 +74,8 @@ generation:
       lora_checkpoint: null  # path to QLoRA adapter weights (not supported with vllm yet)
   # Generation parameters — 0.0 for reproducible experiments
   temperature: 0.0
-  max_tokens: 1024
-  num_recommendations: 15  # initial recommendation candidates for reranking
+  max_tokens: 2048
+  num_recommendations: 12  # initial recommendation candidates for reranking
   # NLI post-retrieval filter (ARAG-inspired)
   nli_filter:
     enabled: true
@@ -135,4 +135,4 @@ post_rank:
     base_rank_weight: 0.55
     prior_weight: 0.20
     user_term_weight: 0.25
-    final_top_n: 10  # final recommendations after reranking
+    final_top_n: 8  # final recommendations after reranking

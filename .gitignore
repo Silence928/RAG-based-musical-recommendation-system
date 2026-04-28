@@ -32,5 +32,7 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+.tmp.driveupload/
+
 # Config with secrets (use env vars instead)
 # configs/config.yaml is tracked but api_key should be null
