@@ -27,6 +27,8 @@ def build_global_quality_priors(
     quality_weight: float = 0.7,
     rarity_weight: float = 0.3,
     neg_penalty: float = 0.4,
+    high_neg_ratio_threshold: float = 0.0,
+    high_neg_ratio_penalty: float = 0.0,
 ) -> dict[str, dict]:
     """
     Build per-musical global priors from crowd-level feedback.
@@ -69,8 +71,11 @@ def build_global_quality_priors(
         quality = (pos + 1.0) / (total + 2.0)
         rarity_bonus = 1.0 / (1.0 + math.log1p(total + 1.0))
         neg_bias = max(0.0, (neg - pos) / (total + 1.0))
+        neg_ratio = (neg / total) if total > 0 else 0.0
 
         prior_score = quality_weight * quality + rarity_weight * rarity_bonus - neg_penalty * neg_bias
+        if high_neg_ratio_threshold > 0 and neg_ratio >= high_neg_ratio_threshold:
+            prior_score -= high_neg_ratio_penalty
         prior_score = max(0.0, min(1.0, prior_score))
 
         priors[normalize_musical_name(name)] = {
@@ -81,6 +86,7 @@ def build_global_quality_priors(
             "quality": quality,
             "rarity_bonus": rarity_bonus,
             "neg_bias": neg_bias,
+            "neg_ratio": neg_ratio,
             "prior_score": prior_score,
         }
     return priors
@@ -226,6 +232,7 @@ def rerank_with_global_priors(
     base_rank_weight: float = 0.55,
     prior_weight: float = 0.20,
     user_term_weight: float = 0.25,
+    dislike_hit_penalty: float = 0.0,
     retrieved: Optional[dict] = None,
     user_like_map: Optional[dict[str, set[str]]] = None,
     user_dislike_map: Optional[dict[str, set[str]]] = None,
@@ -267,10 +274,12 @@ def rerank_with_global_priors(
 
         base_rank_score = 1.0 if n == 1 else 1.0 - (idx / max(1, n - 1))
         user_term = user_terms.get(key, {}).get("user_term", 0.0)
+        dislike_hit = user_terms.get(key, {}).get("dislike_co_norm", 0.0)
         final_score = (
             base_rank_weight * base_rank_score
             + prior_weight * prior["prior_score"]
             + user_term_weight * user_term
+            - dislike_hit_penalty * dislike_hit
         )
 
         item = dict(rec)
@@ -280,11 +289,13 @@ def rerank_with_global_priors(
             item["_prior_quality"] = prior["quality"]
             item["_prior_mentions"] = prior["total"]
             item["_prior_neg_bias"] = prior["neg_bias"]
+            item["_prior_neg_ratio"] = prior.get("neg_ratio", 0.0)
             item["_prior_score"] = prior["prior_score"]
             item["_base_rank_score"] = base_rank_score
             item["_like_co_norm"] = ut.get("like_co_norm", 0.0)
             item["_dislike_co_norm"] = ut.get("dislike_co_norm", 0.0)
             item["_user_term"] = user_term
+            item["_dislike_hit_penalty"] = dislike_hit_penalty * dislike_hit
         rescored.append(item)
 
     rescored.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)

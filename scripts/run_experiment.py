@@ -230,9 +230,12 @@ def main():
     prior_quality_weight = float(prior_cfg.get("quality_weight", 0.7))
     prior_rarity_weight = float(prior_cfg.get("rarity_weight", 0.3))
     prior_neg_penalty = float(prior_cfg.get("neg_penalty", 0.4))
+    prior_high_neg_ratio_threshold = float(prior_cfg.get("high_neg_ratio_threshold", 0.0))
+    prior_high_neg_ratio_penalty = float(prior_cfg.get("high_neg_ratio_penalty", 0.0))
     prior_base_rank_weight = float(prior_cfg.get("base_rank_weight", 0.55))
     prior_blend_weight = float(prior_cfg.get("prior_weight", 0.20))
     prior_user_term_weight = float(prior_cfg.get("user_term_weight", 0.25))
+    prior_dislike_hit_penalty = float(prior_cfg.get("dislike_hit_penalty", 0.0))
     prior_lambda_like = float(prior_cfg.get("lambda_like", 1.0))
     prior_lambda_dislike = float(prior_cfg.get("lambda_dislike", 1.2))
     final_top_n = int(prior_cfg.get("final_top_n", 10))
@@ -245,15 +248,20 @@ def main():
             quality_weight=prior_quality_weight,
             rarity_weight=prior_rarity_weight,
             neg_penalty=prior_neg_penalty,
+            high_neg_ratio_threshold=prior_high_neg_ratio_threshold,
+            high_neg_ratio_penalty=prior_high_neg_ratio_penalty,
         )
         logger.info(
             "Global-prior rerank enabled "
             f"(base={prior_base_rank_weight:.2f}, prior={prior_blend_weight:.2f}, "
             f"user_term={prior_user_term_weight:.2f}, "
+            f"dislike_hit_penalty={prior_dislike_hit_penalty:.2f}, "
             f"lambda_like={prior_lambda_like:.2f}, lambda_dislike={prior_lambda_dislike:.2f}, "
             f"final_top_n={final_top_n}, "
             f"quality={prior_quality_weight:.2f}, rarity={prior_rarity_weight:.2f}, "
-            f"neg_penalty={prior_neg_penalty:.2f})"
+            f"neg_penalty={prior_neg_penalty:.2f}, "
+            f"high_neg_ratio_threshold={prior_high_neg_ratio_threshold:.2f}, "
+            f"high_neg_ratio_penalty={prior_high_neg_ratio_penalty:.2f})"
         )
 
     all_metrics = {}
@@ -319,6 +327,7 @@ def main():
                         base_rank_weight=prior_base_rank_weight,
                         prior_weight=prior_blend_weight,
                         user_term_weight=prior_user_term_weight,
+                        dislike_hit_penalty=prior_dislike_hit_penalty,
                         retrieved=retrieved,
                         user_like_map=user_like_map,
                         user_dislike_map=user_dislike_map,
@@ -394,6 +403,7 @@ def main():
                         base_rank_weight=prior_base_rank_weight,
                         prior_weight=prior_blend_weight,
                         user_term_weight=prior_user_term_weight,
+                        dislike_hit_penalty=prior_dislike_hit_penalty,
                         retrieved=empty_retrieved,
                         user_like_map=user_like_map,
                         user_dislike_map=user_dislike_map,
@@ -465,6 +475,7 @@ def main():
                                     base_rank_weight=prior_base_rank_weight,
                                     prior_weight=prior_blend_weight,
                                     user_term_weight=prior_user_term_weight,
+                                    dislike_hit_penalty=prior_dislike_hit_penalty,
                                     retrieved=retrieved,
                                     user_like_map=user_like_map,
                                     user_dislike_map=user_dislike_map,
@@ -534,6 +545,7 @@ def main():
                                 base_rank_weight=prior_base_rank_weight,
                                 prior_weight=prior_blend_weight,
                                 user_term_weight=prior_user_term_weight,
+                                dislike_hit_penalty=prior_dislike_hit_penalty,
                                 retrieved=retrieved,
                                 user_like_map=user_like_map,
                                 user_dislike_map=user_dislike_map,

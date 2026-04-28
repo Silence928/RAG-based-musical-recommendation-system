@@ -75,10 +75,14 @@ def load_resources():
         quality_weight=float(prior_cfg.get("quality_weight", 0.7)),
         rarity_weight=float(prior_cfg.get("rarity_weight", 0.3)),
         neg_penalty=float(prior_cfg.get("neg_penalty", 0.4)),
+        high_neg_ratio_threshold=float(prior_cfg.get("high_neg_ratio_threshold", 0.0)),
+        high_neg_ratio_penalty=float(prior_cfg.get("high_neg_ratio_penalty", 0.0)),
     )
     users_path = Path(config["paths"]["processed_data"]) / "users.jsonl"
     users_data = load_jsonl(str(users_path))
     user_like_map, user_dislike_map = build_user_preference_maps(users_data)
+    global_positive_bank = _build_global_positive_bank(pos_index.records, limit_per_musical=10)
+    global_negative_bank = _build_global_negative_bank(neg_index.records, limit_per_musical=10)
 
     return (
         config,
@@ -89,6 +93,8 @@ def load_resources():
         user_like_map,
         user_dislike_map,
         final_top_n,
+        global_positive_bank,
+        global_negative_bank,
     )
 
 
@@ -118,6 +124,91 @@ def _build_name_aliases(allowed_names: list[str]) -> dict[str, str]:
         if norm:
             aliases[norm] = name
     return aliases
+
+
+def _build_global_positive_bank(pos_records: list[dict], limit_per_musical: int = 10) -> dict[str, list[str]]:
+    """
+    Build a global evidence bank from full positive corpus:
+    musical -> liked-user reasons.
+    """
+    bank: dict[str, list[str]] = {}
+    for row in pos_records or []:
+        musical = str(row.get("musical", "")).strip()
+        reason = str(row.get("reason", "")).strip()
+        if not musical or not reason:
+            continue
+        key = _normalize_name(musical)
+        bucket = bank.setdefault(key, [])
+        if reason in bucket:
+            continue
+        if len(bucket) >= limit_per_musical:
+            continue
+        bucket.append(reason)
+    return bank
+
+
+def _build_global_negative_bank(neg_records: list[dict], limit_per_musical: int = 10) -> dict[str, list[str]]:
+    """
+    Build a global negative evidence bank from full negative corpus:
+    musical -> disliked-user reasons.
+    """
+    bank: dict[str, list[str]] = {}
+    for row in neg_records or []:
+        musical = str(row.get("musical", "")).strip()
+        reason = str(row.get("reason", "")).strip()
+        if not musical or not reason:
+            continue
+        key = _normalize_name(musical)
+        bucket = bank.setdefault(key, [])
+        if reason in bucket:
+            continue
+        if len(bucket) >= limit_per_musical:
+            continue
+        bucket.append(reason)
+    return bank
+
+
+def _name_variants_for_evidence(name: str) -> list[str]:
+    """
+    Build normalized alias variants for loose evidence lookup.
+    """
+    base = _normalize_name(name)
+    if not base:
+        return []
+    variants = {base}
+    # Common wrappers/edition words in Chinese musical naming.
+    for token in ("中文版", "中国版", "音乐剧", "韩版", "日版", "法版", "英版", "原版"):
+        variants.add(base.replace(token, ""))
+    variants = {v for v in variants if v}
+    return sorted(variants, key=len, reverse=True)
+
+
+def _lookup_evidence_with_alias(
+    key_name: str,
+    bank: dict[str, list],
+) -> tuple[list, str]:
+    """
+    Try exact -> alias -> fuzzy containment lookup.
+    """
+    variants = _name_variants_for_evidence(key_name)
+    if not variants:
+        return [], "none"
+
+    # 1) exact/alias direct hit
+    for v in variants:
+        if v in bank and bank[v]:
+            return bank[v], "alias_direct"
+
+    # 2) fuzzy containment hit
+    for v in variants:
+        if len(v) < 2:
+            continue
+        for k, items in bank.items():
+            if not items:
+                continue
+            if v in k or k in v:
+                return items, "alias_fuzzy"
+    return [], "none"
 
 
 def _extract_structured_preferences(user_text: str, allowed_names: list[str]) -> dict:
@@ -194,18 +285,12 @@ def _build_demo_user_from_text(user_text: str, allowed_names: list[str]) -> dict
     }
 
 
-def _format_evidence_quotes(rec: dict, fallback_evidence: list[str]) -> str:
-    quotes = rec.get("evidence_quotes", [])
-    if isinstance(quotes, list):
-        quotes = [q.strip() for q in quotes if isinstance(q, str) and q.strip()]
-    else:
-        quotes = []
-
-    if not quotes:
-        quotes = fallback_evidence[:2]
-    else:
-        quotes = quotes[:2]
-
+def _format_evidence_quotes(fallback_evidence: list[str]) -> str:
+    """
+    Evidence must come from retrieved real user comments.
+    Do NOT trust/echo model-generated evidence_quotes here.
+    """
+    quotes = [q.strip() for q in fallback_evidence if isinstance(q, str) and q.strip()][:2]
     if not quotes:
         return "（未命中该剧的直接用户评论证据）"
     return "；".join([f"“{q}”" for q in quotes])
@@ -213,12 +298,13 @@ def _format_evidence_quotes(rec: dict, fallback_evidence: list[str]) -> str:
 
 def _build_evidence_bank(retrieved: dict, limit_per_musical: int = 3) -> dict[str, list[dict]]:
     """
-    Evidence grouped by musical, built from retrieved neighbors.
+    Evidence grouped by musical, built from retrieved positive neighbors only.
+    This ensures evidence means "users who liked this musical".
     Keep full reason text (no truncation) for better readability.
     """
     bank: dict[str, list[dict]] = {}
-    all_pairs = (retrieved.get("positive_pairs", []) or []) + (retrieved.get("negative_pairs", []) or [])
-    for record, _score in all_pairs:
+    positive_pairs = retrieved.get("positive_pairs", []) or []
+    for record, _score in positive_pairs:
         musical = str(record.get("musical", "")).strip()
         reason = str(record.get("reason", "")).strip()
         if not musical or not reason:
@@ -226,6 +312,29 @@ def _build_evidence_bank(retrieved: dict, limit_per_musical: int = 3) -> dict[st
         key = _normalize_name(musical)
         bucket = bank.setdefault(key, [])
         if len(bucket) >= limit_per_musical:
+            continue
+        if any(x.get("reason") == reason for x in bucket):
+            continue
+        bucket.append({"musical": musical, "reason": reason})
+    return bank
+
+
+def _build_negative_evidence_bank(retrieved: dict, limit_per_musical: int = 3) -> dict[str, list[dict]]:
+    """
+    Negative evidence grouped by musical, built from retrieved negative neighbors.
+    """
+    bank: dict[str, list[dict]] = {}
+    negative_pairs = retrieved.get("negative_pairs", []) or []
+    for record, _score in negative_pairs:
+        musical = str(record.get("musical", "")).strip()
+        reason = str(record.get("reason", "")).strip()
+        if not musical or not reason:
+            continue
+        key = _normalize_name(musical)
+        bucket = bank.setdefault(key, [])
+        if len(bucket) >= limit_per_musical:
+            continue
+        if any(x.get("reason") == reason for x in bucket):
             continue
         bucket.append({"musical": musical, "reason": reason})
     return bank
@@ -241,12 +350,40 @@ def _collect_global_evidence(evidence_bank: dict[str, list[dict]], limit: int = 
     return merged
 
 
-def _evidence_for_musical(musical: str, evidence_bank: dict[str, list[dict]]) -> list[str]:
-    key = _normalize_name(musical)
-    items = evidence_bank.get(key, [])
-    if items:
-        return [x["reason"] for x in items[:2]]
-    return []
+def _evidence_for_musical(
+    musical: str,
+    local_evidence_bank: dict[str, list[dict]],
+    global_positive_bank: dict[str, list[str]],
+) -> tuple[list[str], str]:
+    local_items, local_hit = _lookup_evidence_with_alias(musical, local_evidence_bank)
+    if local_items:
+        return [x["reason"] for x in local_items[:2]], (
+            "positive_pairs_local" if local_hit == "alias_direct" else "positive_pairs_local_fuzzy"
+        )
+    global_items, global_hit = _lookup_evidence_with_alias(musical, global_positive_bank)
+    if global_items:
+        return global_items[:2], (
+            "positive_pairs_global" if global_hit == "alias_direct" else "positive_pairs_global_fuzzy"
+        )
+    return [], "none"
+
+
+def _negative_evidence_for_musical(
+    musical: str,
+    local_negative_bank: dict[str, list[dict]],
+    global_negative_bank: dict[str, list[str]],
+) -> tuple[list[str], str]:
+    local_items, local_hit = _lookup_evidence_with_alias(musical, local_negative_bank)
+    if local_items:
+        return [x["reason"] for x in local_items[:2]], (
+            "negative_pairs_local" if local_hit == "alias_direct" else "negative_pairs_local_fuzzy"
+        )
+    global_items, global_hit = _lookup_evidence_with_alias(musical, global_negative_bank)
+    if global_items:
+        return global_items[:2], (
+            "negative_pairs_global" if global_hit == "alias_direct" else "negative_pairs_global_fuzzy"
+        )
+    return [], "none"
 
 
 def _is_generic_fallback_reason(reason: str) -> bool:
@@ -272,7 +409,86 @@ def _make_non_template_reason(rec: dict, evidence_for_this_musical: list[str], u
     return "该剧在当前检索候选中的综合得分较高。"
 
 
-def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> str:
+def _candidate_level_summary(
+    generator: MeloGenerator,
+    musical: str,
+    user: dict,
+    positive_evidence_for_this_musical: list[str],
+    negative_evidence_for_this_musical: list[str],
+    fallback_reason: str,
+) -> str:
+    """
+    Candidate-level summarization:
+    - Summarize one candidate at a time.
+    - Only use evidence matched to this candidate from retrieved positive pairs.
+    - If evidence is missing, return evidence-insufficient explicitly.
+    """
+    positive_evidence = [
+        e.strip() for e in positive_evidence_for_this_musical if isinstance(e, str) and e.strip()
+    ][:2]
+    negative_evidence = [
+        e.strip() for e in negative_evidence_for_this_musical if isinstance(e, str) and e.strip()
+    ][:2]
+
+    if not positive_evidence and not negative_evidence:
+        return "证据不足（未命中该剧的直接用户评论证据），暂不对该剧做强结论。"
+
+    like_names = [x.get("musical", "") for x in user.get("likes", []) if x.get("musical")]
+    dislike_names = [x.get("musical", "") for x in user.get("dislikes", []) if x.get("musical")]
+    profile_line = (
+        f"用户偏好剧目: {', '.join(like_names) if like_names else '无'}\n"
+        f"用户避雷剧目: {', '.join(dislike_names) if dislike_names else '无'}"
+    )
+
+    system_prompt = (
+        "你是音乐剧推荐解释助手。"
+        "你只能基于给定证据写候选级总结，不得泛化。"
+        "你必须在内部执行以下三步，但不要输出步骤过程："
+        "第1步：从证据中提取可被直接支持的事实；"
+        "第2步：判断哪些常见结论无法被证据支持；"
+        "第3步：仅基于可支持事实生成最终理由。"
+        "如果证据未明确支持某判断，必须写“证据不足”，不要编造。"
+    )
+    user_prompt = (
+        f"候选剧目：{musical}\n"
+        f"{profile_line}\n"
+        "候选剧正向证据（喜欢该剧的用户评论，仅此可用）：\n"
+        + ("\n".join([f"- {q}" for q in positive_evidence]) if positive_evidence else "- 无")
+        + "\n\n候选剧负向证据（不喜欢该剧的用户评论，仅此可用）：\n"
+        + ("\n".join([f"- {q}" for q in negative_evidence]) if negative_evidence else "- 无")
+        + "\n\n写作约束：\n"
+        "- 只输出 1-2 句中文，不要分点。\n"
+        "- 先在内部完成“三步判断”，但不要输出思考过程或中间步骤。\n"
+        "- 不得使用“剧情强”“情感共鸣”“逻辑清晰”等空泛词，除非证据原句明确提到对应信息。\n"
+        "- 若证据不够支撑，必须包含“证据不足”四个字。\n"
+        "- 禁止引用候选剧以外的证据。\n"
+        "- 若负向证据明确包含剧情弱/逻辑混乱等风险，必须在理由中提示风险，不能只写正向结论。\n"
+    )
+
+    try:
+        summary = generator.llm.chat(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.0,
+            max_tokens=160,
+        ).strip()
+        if not summary:
+            return fallback_reason
+        return summary
+    except Exception:
+        return fallback_reason
+
+
+def _format_recommendation_reply(
+    result: dict,
+    retrieved: dict,
+    user: dict,
+    generator: MeloGenerator,
+    global_positive_bank: dict[str, list[str]],
+    global_negative_bank: dict[str, list[str]],
+) -> str:
     recs = result.get("recommendations", [])
     if not recs:
         return "暂时没有生成有效推荐，请换一种表达再试一次。"
@@ -296,27 +512,47 @@ def _format_recommendation_reply(result: dict, retrieved: dict, user: dict) -> s
     lines.append("已根据你的描述生成推荐（已加入全局质量权重重排）：")
 
     evidence_bank = _build_evidence_bank(retrieved)
-    fallback_pool = _collect_global_evidence(evidence_bank)
+    negative_evidence_bank = _build_negative_evidence_bank(retrieved)
     for idx, rec in enumerate(recs, start=1):
         musical = rec.get("musical", "未知剧目")
-        per_musical_evidence = _evidence_for_musical(musical, evidence_bank)
-        reason = _make_non_template_reason(rec, per_musical_evidence, user)
-        evidence = _format_evidence_quotes(rec, per_musical_evidence)
+        per_musical_evidence, evidence_source = _evidence_for_musical(
+            musical, evidence_bank, global_positive_bank
+        )
+        per_musical_negative_evidence, negative_evidence_source = _negative_evidence_for_musical(
+            musical, negative_evidence_bank, global_negative_bank
+        )
+        fallback_reason = _make_non_template_reason(rec, per_musical_evidence, user)
+        reason = _candidate_level_summary(
+            generator,
+            musical,
+            user,
+            per_musical_evidence,
+            per_musical_negative_evidence,
+            fallback_reason,
+        )
+        evidence = _format_evidence_quotes(per_musical_evidence)
+        matched_count = len(per_musical_evidence)
+        negative_matched_count = len(per_musical_negative_evidence)
         quality = rec.get("_prior_quality", 0.5)
         mentions = rec.get("_prior_mentions", 0)
+        neg_ratio = rec.get("_prior_neg_ratio", 0.0)
         user_term = rec.get("_user_term", 0.0)
+        dislike_penalty = rec.get("_dislike_hit_penalty", 0.0)
         lines.append(f"{idx}. {musical}")
         lines.append(f"   推荐理由：{reason}")
         lines.append(f"   真实评论证据：{evidence}")
+        lines.append(f"   证据来源：evidence_source={evidence_source}, matched_count={matched_count}")
+        if negative_matched_count > 0:
+            lines.append(
+                f"   负向风险证据：{_format_evidence_quotes(per_musical_negative_evidence)}"
+            )
+            lines.append(
+                f"   风险证据来源：negative_evidence_source={negative_evidence_source}, negative_matched_count={negative_matched_count}"
+            )
         lines.append(
-            f"   打分分解：quality={quality:.2f}, mentions={mentions}, user_term={user_term:.2f}, final={rec.get('_rerank_score', 0.0):.2f}"
+            f"   打分分解：quality={quality:.2f}, mentions={mentions}, neg_ratio={neg_ratio:.2f}, user_term={user_term:.2f}, dislike_penalty={dislike_penalty:.2f}, final={rec.get('_rerank_score', 0.0):.2f}"
         )
 
-    if fallback_pool:
-        lines.append("")
-        lines.append("检索到的相似用户真实评论片段（节选）：")
-        for item in fallback_pool[:4]:
-            lines.append(f"- [{item.get('musical', '未知剧目')}] {item.get('reason', '')}")
     return "\n".join(lines)
 
 
@@ -338,6 +574,8 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
         user_like_map,
         user_dislike_map,
         final_top_n,
+        global_positive_bank,
+        global_negative_bank,
     ) = RESOURCES
     user = _build_demo_user_from_text(text, allowed_names)
     top_k = config["retrieval"]["default_top_k"]
@@ -360,6 +598,7 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
             base_rank_weight=float(prior_cfg.get("base_rank_weight", 0.55)),
             prior_weight=float(prior_cfg.get("prior_weight", 0.20)),
             user_term_weight=float(prior_cfg.get("user_term_weight", 0.25)),
+            dislike_hit_penalty=float(prior_cfg.get("dislike_hit_penalty", 0.0)),
             retrieved=retrieved,
             user_like_map=user_like_map,
             user_dislike_map=user_dislike_map,
@@ -368,7 +607,9 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
             attach_debug_fields=True,
         )
         output["recommendations"] = output.get("recommendations", [])[:final_top_n]
-        reply = _format_recommendation_reply(output, retrieved, user)
+        reply = _format_recommendation_reply(
+            output, retrieved, user, generator, global_positive_bank, global_negative_bank
+        )
     except Exception as e:
         reply = f"推荐流程出错：{e}"
 

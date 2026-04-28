@@ -1,0 +1,131 @@
+# ======================== MeloMatch Configuration (Teammate FT Test) ========================
+#
+# Purpose:
+# - Temporary offline experiment config to test teammate fine-tuned model.
+# - Keeps original configs/config.yaml untouched for easy rollback.
+#
+# Usage:
+#   python scripts/run_experiment.py --config configs/config_teammate_ft.yaml --subset 100
+#   python scripts/run_experiment.py --config configs/config_teammate_ft.yaml
+#
+# Rollback:
+# - Use your original config again:
+#   python scripts/run_experiment.py --config configs/config.yaml --subset 100
+#
+
+project:
+  name: "MeloMatch"
+  version: "0.1.0-ft-test"
+
+# ----- Paths -----
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  knowledge_base: "data/knowledge_base"
+  index_dir: "data/indices"
+  results_dir: "results"
+
+# ----- Data -----
+data:
+  format: "csv"
+  likes_per_user: 3
+  dislikes_per_user: 3
+  holdout: 1
+
+# ----- Retrieval -----
+retrieval:
+  embedding_model: "BAAI/bge-base-zh-v1.5"
+  embedding_dim: 768
+  bm25:
+    k1: 1.5
+    b: 0.75
+  dense:
+    similarity: "cosine"
+  hybrid:
+    rrf_k: 60
+  top_k_options: [1, 3, 5, 10]
+  default_top_k: 5
+  kb_top_m: 10
+  contrastive_rerank:
+    enabled: true
+    alpha: 0.3
+
+# ----- Generation -----
+generation:
+  models:
+    zero_shot:
+      name: "Qwen/Qwen3-14B"
+      backend: "vllm"
+      enable_thinking: false
+      dtype: "bfloat16"
+      tensor_parallel_size: 1
+      max_model_len: 4096
+      gpu_memory_utilization: 0.90
+
+    # Teammate fine-tuned merged model (Colab local path after snapshot_download).
+    # HF repo: https://huggingface.co/Zihe1234/melomatch-merged
+    # NOTE:
+    # - This repo stores actual model files under subfolder "melomatch-merged/".
+    # - vLLM expects a directory containing config.json directly, so point to local subfolder path.
+    fine_tuned:
+      name: "/content/models/melomatch_repo/melomatch-merged"
+      backend: "vllm"
+      enable_thinking: false
+      dtype: "float16"
+      tensor_parallel_size: 1
+      max_model_len: 4096
+      gpu_memory_utilization: 0.90
+      lora_checkpoint: null
+
+  temperature: 0.0
+  max_tokens: 2048
+  num_recommendations: 12
+  nli_filter:
+    enabled: true
+    threshold: 0.6
+  preference_profile:
+    enabled: true
+    use_llm: true
+
+# ----- Evaluation -----
+evaluation:
+  hit_k: [1, 3, 5]
+  avoidance_k: [3, 5]
+  soft_match_tag_threshold: 2
+  human_eval:
+    num_evaluators: 15
+    faithfulness_scale: [1, 2, 3, 4, 5]
+
+# ----- Experiment -----
+experiment:
+  signals: ["dual_enhanced"]
+  methods: ["dense"]
+  # Run only teammate fine-tuned model for this test.
+  backbones: ["fine_tuned"]
+  user_subsets: [25, 50, 100]
+  seed: 42
+
+# ----- Text Expansion -----
+text_expansion:
+  domain_lexicon:
+    enabled: true
+    mode: "prompt_context"
+    path: "data/raw/domain_lexicon.json"
+    max_expansions_per_text: 3
+
+# ----- Post Ranking -----
+post_rank:
+  global_prior:
+    enabled: true
+    quality_weight: 0.7
+    rarity_weight: 0.3
+    neg_penalty: 0.7
+    high_neg_ratio_threshold: 0.6
+    high_neg_ratio_penalty: 0.2
+    lambda_like: 1.0
+    lambda_dislike: 1.2
+    base_rank_weight: 0.40
+    prior_weight: 0.30
+    user_term_weight: 0.30
+    dislike_hit_penalty: 0.60
+    final_top_n: 8
