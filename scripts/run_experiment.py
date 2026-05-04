@@ -20,6 +20,7 @@ import argparse
 import gc
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from itertools import product
@@ -64,6 +65,91 @@ def _load_backbone(model_cfg: dict, logger):
         return model, tokenizer
     # vllm and api backends are handled by create_llm() directly
     return None, None
+
+
+def _sentence_split(text: str) -> list[str]:
+    return [x.strip() for x in re.split(r"[。！？!?\n；;]+", text or "") if x and x.strip()]
+
+
+def _rule_based_semantic_dimensions(user_text: str) -> dict[str, list[str]]:
+    text = (user_text or "").strip()
+    if not text:
+        return {"semantic": [], "emotional": [], "stagecraft": [], "songs": []}
+    semantic_terms: list[str] = []
+    emotional_terms: list[str] = []
+    stagecraft_terms: list[str] = []
+    songs_terms: list[str] = []
+    semantic_kw = ("剧情", "逻辑", "节奏", "叙事", "改编", "魔改", "故事", "立意", "高考", "成长", "题材", "主题")
+    emotional_kw = ("共情", "生命力", "自由", "爱", "感动", "流泪", "情感", "情绪")
+    stagecraft_kw = ("舞美", "灯光", "服装", "布景", "英伦", "视觉", "美术", "造型", "舞台", "调度")
+    songs_kw = ("歌", "歌曲", "旋律", "编曲", "词曲", "唱段", "唱腔", "配乐", "音乐")
+    for sent in _sentence_split(text):
+        if any(k in sent for k in semantic_kw):
+            semantic_terms.append(sent)
+        if any(k in sent for k in emotional_kw):
+            emotional_terms.append(sent)
+        if any(k in sent for k in stagecraft_kw):
+            stagecraft_terms.append(sent)
+        if any(k in sent for k in songs_kw):
+            songs_terms.append(sent)
+    return {
+        "semantic": semantic_terms[:3],
+        "emotional": emotional_terms[:3],
+        "stagecraft": stagecraft_terms[:3],
+        "songs": songs_terms[:3],
+    }
+
+
+def _user_to_dimension_text(user: dict) -> str:
+    likes = [
+        f"喜欢 {x.get('musical', '')}：{x.get('reason', '')}".strip()
+        for x in user.get("likes", [])
+        if x.get("musical") or x.get("reason")
+    ]
+    dislikes = [
+        f"不喜欢 {x.get('musical', '')}：{x.get('reason', '')}".strip()
+        for x in user.get("dislikes", [])
+        if x.get("musical") or x.get("reason")
+    ]
+    return "\n".join(likes + dislikes)
+
+
+def _llm_semantic_dimensions_for_user(llm, user_text: str, prompt_template: str | None) -> dict[str, list[str]]:
+    if not user_text.strip():
+        return {"semantic": [], "emotional": [], "stagecraft": [], "songs": []}
+    if not llm:
+        return _rule_based_semantic_dimensions(user_text)
+    if prompt_template:
+        prompt = prompt_template.format(user_text=user_text)
+    else:
+        prompt = (
+            "请将以下用户偏好拆解为四个维度，并仅返回 JSON 对象：\n"
+            '{"semantic": [...], "emotional": [...], "stagecraft": [...], "songs": [...]}。\n'
+            "要求：每个维度最多3条；只提取明确信息；缺失返回空数组；只输出JSON。\n"
+            f"用户文本：\n{user_text}\n"
+        )
+    try:
+        raw = llm.chat(
+            [
+                {"role": "system", "content": "你是偏好语义解析器，只返回JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=220,
+        ).strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end <= start:
+            return _rule_based_semantic_dimensions(user_text)
+        obj = json.loads(raw[start:end + 1])
+        out = {"semantic": [], "emotional": [], "stagecraft": [], "songs": []}
+        for key in out:
+            vals = obj.get(key, [])
+            if isinstance(vals, list):
+                out[key] = [str(v).strip() for v in vals if str(v).strip()][:3]
+        return out
+    except Exception:
+        return _rule_based_semantic_dimensions(user_text)
 
 
 def main():
@@ -238,6 +324,9 @@ def main():
     prior_dislike_hit_penalty = float(prior_cfg.get("dislike_hit_penalty", 0.0))
     prior_lambda_like = float(prior_cfg.get("lambda_like", 1.0))
     prior_lambda_dislike = float(prior_cfg.get("lambda_dislike", 1.2))
+    prior_semantic_alignment_weight = float(prior_cfg.get("semantic_alignment_weight", 0.35))
+    prior_semantic_route_weights = prior_cfg.get("semantic_route_weights")
+    prior_semantic_channel_weights = prior_cfg.get("semantic_channel_weights")
     final_top_n = int(prior_cfg.get("final_top_n", 10))
     global_priors = {}
     if prior_enabled:
@@ -256,6 +345,7 @@ def main():
             f"(base={prior_base_rank_weight:.2f}, prior={prior_blend_weight:.2f}, "
             f"user_term={prior_user_term_weight:.2f}, "
             f"dislike_hit_penalty={prior_dislike_hit_penalty:.2f}, "
+            f"semantic_alignment_weight={prior_semantic_alignment_weight:.2f}, "
             f"lambda_like={prior_lambda_like:.2f}, lambda_dislike={prior_lambda_dislike:.2f}, "
             f"final_top_n={final_top_n}, "
             f"quality={prior_quality_weight:.2f}, rarity={prior_rarity_weight:.2f}, "
@@ -263,6 +353,20 @@ def main():
             f"high_neg_ratio_threshold={prior_high_neg_ratio_threshold:.2f}, "
             f"high_neg_ratio_penalty={prior_high_neg_ratio_penalty:.2f})"
         )
+
+    prompts_dir = config.get("paths", {}).get("prompts", "configs/prompts")
+    dim_prompt_path = Path(prompts_dir) / "preference_deconstruction.txt"
+    dim_prompt_template = dim_prompt_path.read_text(encoding="utf-8") if dim_prompt_path.exists() else None
+    dim_cache: dict[str, dict[str, list[str]]] = {}
+
+    def _attach_semantic_dimensions(user_obj: dict) -> dict:
+        text = _user_to_dimension_text(user_obj)
+        if text not in dim_cache:
+            dim_cache[text] = _llm_semantic_dimensions_for_user(zs_llm, text, dim_prompt_template)
+        out = dict(user_obj)
+        out["meta"] = dict(user_obj.get("meta", {}))
+        out["meta"]["semantic_dimensions"] = dim_cache[text]
+        return out
 
     all_metrics = {}
 
@@ -291,6 +395,7 @@ def main():
             modified_user, held_out = hold_out_one_like(user, seed)
             if not held_out:
                 continue
+            modified_user = _attach_semantic_dimensions(modified_user)
 
             try:
                 # For dual_enhanced, retrieve as "dual" then enhance
@@ -333,6 +438,9 @@ def main():
                         user_dislike_map=user_dislike_map,
                         lambda_like=prior_lambda_like,
                         lambda_dislike=prior_lambda_dislike,
+                        semantic_alignment_weight=prior_semantic_alignment_weight,
+                        semantic_route_weights=prior_semantic_route_weights,
+                        semantic_channel_weights=prior_semantic_channel_weights,
                     )
                 output["recommendations"] = output.get("recommendations", [])[:final_top_n]
 
@@ -409,6 +517,9 @@ def main():
                         user_dislike_map=user_dislike_map,
                         lambda_like=prior_lambda_like,
                         lambda_dislike=prior_lambda_dislike,
+                        semantic_alignment_weight=prior_semantic_alignment_weight,
+                        semantic_route_weights=prior_semantic_route_weights,
+                        semantic_channel_weights=prior_semantic_channel_weights,
                     )
                 output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                 baseline_results.append({
@@ -462,6 +573,7 @@ def main():
                         modified_user, held_out = hold_out_one_like(user, seed)
                         if not held_out:
                             continue
+                        modified_user = _attach_semantic_dimensions(modified_user)
                         try:
                             retrieval_signal = "dual" if signal == "dual_enhanced" else signal
                             retrieved = retriever.retrieve(
@@ -481,6 +593,9 @@ def main():
                                     user_dislike_map=user_dislike_map,
                                     lambda_like=prior_lambda_like,
                                     lambda_dislike=prior_lambda_dislike,
+                                    semantic_alignment_weight=prior_semantic_alignment_weight,
+                                    semantic_route_weights=prior_semantic_route_weights,
+                                    semantic_channel_weights=prior_semantic_channel_weights,
                                 )
                             output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                             cond_results.append({
@@ -533,6 +648,7 @@ def main():
                     modified_user, held_out = hold_out_one_like(user, seed)
                     if not held_out:
                         continue
+                    modified_user = _attach_semantic_dimensions(modified_user)
                     try:
                         retrieved = retriever.retrieve(
                             modified_user, abl_signal, abl_method, top_k, ret_config["kb_top_m"]
@@ -551,6 +667,9 @@ def main():
                                 user_dislike_map=user_dislike_map,
                                 lambda_like=prior_lambda_like,
                                 lambda_dislike=prior_lambda_dislike,
+                                semantic_alignment_weight=prior_semantic_alignment_weight,
+                                semantic_route_weights=prior_semantic_route_weights,
+                                semantic_channel_weights=prior_semantic_channel_weights,
                             )
                         output["recommendations"] = output.get("recommendations", [])[:final_top_n]
                         cond_results.append({

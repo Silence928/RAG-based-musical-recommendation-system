@@ -226,6 +226,62 @@ def compute_user_term_scores(
     return out
 
 
+def compute_semantic_alignment_scores(
+    recommendations: list[dict],
+    retrieved: Optional[dict],
+    route_weights: Optional[dict[str, float]] = None,
+    channel_weights: Optional[dict[str, float]] = None,
+) -> dict[str, float]:
+    """
+    Compute semantic alignment signal from multi-route retrieval hits.
+
+    Positive/KB route hits increase alignment; negative route hits decrease it.
+    Output is normalized to [-1, 1] by max absolute score.
+    """
+    if not recommendations or not retrieved:
+        return {}
+    route_hits = retrieved.get("semantic_route_hits", {}) if isinstance(retrieved, dict) else {}
+    if not isinstance(route_hits, dict) or not route_hits:
+        return {}
+
+    route_weights = route_weights or {
+        "semantic": 1.0,
+        "emotional": 1.0,
+        "stagecraft": 1.0,
+        "songs": 1.0,
+    }
+    channel_weights = channel_weights or {"positive": 1.0, "kb": 0.8, "negative": -1.0}
+
+    cand_keys = {
+        normalize_musical_name(str(rec.get("musical", "")).strip())
+        for rec in recommendations
+        if str(rec.get("musical", "")).strip()
+    }
+    raw_scores: dict[str, float] = {k: 0.0 for k in cand_keys if k}
+
+    for channel, routes in route_hits.items():
+        c_w = float(channel_weights.get(channel, 0.0))
+        if c_w == 0.0 or not isinstance(routes, dict):
+            continue
+        for route_name, hits in routes.items():
+            r_w = float(route_weights.get(route_name, 0.0))
+            if r_w == 0.0 or not isinstance(hits, list):
+                continue
+            for rank, hit in enumerate(hits):
+                name = normalize_musical_name(str(hit.get("item", "")).strip())
+                if name not in raw_scores:
+                    continue
+                # Rank-aware decay, route-level contribution.
+                raw_scores[name] += c_w * r_w * (1.0 / (rank + 1))
+
+    if not raw_scores:
+        return {}
+    max_abs = max(abs(v) for v in raw_scores.values())
+    if max_abs <= 0:
+        return {k: 0.0 for k in raw_scores}
+    return {k: v / max_abs for k, v in raw_scores.items()}
+
+
 def rerank_with_global_priors(
     recommendations: list[dict],
     priors: dict[str, dict],
@@ -238,6 +294,9 @@ def rerank_with_global_priors(
     user_dislike_map: Optional[dict[str, set[str]]] = None,
     lambda_like: float = 1.0,
     lambda_dislike: float = 1.2,
+    semantic_alignment_weight: float = 0.35,
+    semantic_route_weights: Optional[dict[str, float]] = None,
+    semantic_channel_weights: Optional[dict[str, float]] = None,
     attach_debug_fields: bool = False,
 ) -> list[dict]:
     """
@@ -257,6 +316,12 @@ def rerank_with_global_priors(
         lambda_like=lambda_like,
         lambda_dislike=lambda_dislike,
     )
+    semantic_alignment = compute_semantic_alignment_scores(
+        recommendations=recommendations,
+        retrieved=retrieved,
+        route_weights=semantic_route_weights,
+        channel_weights=semantic_channel_weights,
+    )
     rescored: list[dict] = []
 
     for idx, rec in enumerate(recommendations):
@@ -275,11 +340,13 @@ def rerank_with_global_priors(
         base_rank_score = 1.0 if n == 1 else 1.0 - (idx / max(1, n - 1))
         user_term = user_terms.get(key, {}).get("user_term", 0.0)
         dislike_hit = user_terms.get(key, {}).get("dislike_co_norm", 0.0)
+        semantic_score = semantic_alignment.get(key, 0.0)
         final_score = (
             base_rank_weight * base_rank_score
             + prior_weight * prior["prior_score"]
             + user_term_weight * user_term
             - dislike_hit_penalty * dislike_hit
+            + semantic_alignment_weight * semantic_score
         )
 
         item = dict(rec)
@@ -296,6 +363,8 @@ def rerank_with_global_priors(
             item["_dislike_co_norm"] = ut.get("dislike_co_norm", 0.0)
             item["_user_term"] = user_term
             item["_dislike_hit_penalty"] = dislike_hit_penalty * dislike_hit
+            item["_semantic_alignment"] = semantic_score
+            item["_semantic_alignment_bonus"] = semantic_alignment_weight * semantic_score
         rescored.append(item)
 
     rescored.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)

@@ -8,6 +8,7 @@ and returns recommended musicals with reasons.
 
 import sys
 import re
+import json
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -106,6 +107,7 @@ WELCOME_TEXT = (
 
 POS_MARKERS = ("喜欢", "爱", "偏好", "想看", "打动", "共情")
 NEG_MARKERS = ("不喜欢", "讨厌", "避雷", "雷点", "不想看", "不要推荐", "不爱看", "踩雷")
+PROMPT_DIR = Path(__file__).resolve().parent.parent / "configs" / "prompts"
 
 
 def _normalize_name(name: str) -> str:
@@ -283,6 +285,88 @@ def _build_demo_user_from_text(user_text: str, allowed_names: list[str]) -> dict
         "dislikes": prefs["dislikes"],
         "meta": {},
     }
+
+
+def _rule_based_semantic_dimensions(user_text: str) -> dict[str, list[str]]:
+    """
+    Lightweight fallback semantic decomposition for four dimensions:
+    semantic / emotional / stagecraft / songs.
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return {"semantic": [], "emotional": [], "stagecraft": [], "songs": []}
+
+    semantic_terms = []
+    emotional_terms = []
+    stagecraft_terms = []
+    songs_terms = []
+
+    # Very small keyword anchors to keep behavior deterministic.
+    semantic_kw = ("剧情", "逻辑", "节奏", "叙事", "改编", "魔改", "故事", "立意", "高考", "成长", "题材", "主题")
+    emotional_kw = ("共情", "生命力", "自由", "爱", "感动", "流泪", "情感", "情绪")
+    stagecraft_kw = ("舞美", "灯光", "服装", "布景", "英伦", "视觉", "美术", "造型", "舞台", "调度")
+    songs_kw = ("歌", "歌曲", "旋律", "编曲", "词曲", "唱段", "唱腔", "配乐", "音乐")
+
+    for sent in _sentence_split(text):
+        if any(k in sent for k in semantic_kw):
+            semantic_terms.append(sent)
+        if any(k in sent for k in emotional_kw):
+            emotional_terms.append(sent)
+        if any(k in sent for k in stagecraft_kw):
+            stagecraft_terms.append(sent)
+        if any(k in sent for k in songs_kw):
+            songs_terms.append(sent)
+
+    return {
+        "semantic": semantic_terms[:3],
+        "emotional": emotional_terms[:3],
+        "stagecraft": stagecraft_terms[:3],
+        "songs": songs_terms[:3],
+    }
+
+
+def _llm_semantic_dimensions(generator: MeloGenerator, user_text: str) -> dict[str, list[str]]:
+    """
+    LLM-based deconstruction:
+    parse user text into semantic / emotional / stagecraft / songs dimensions.
+    """
+    template_path = PROMPT_DIR / "preference_deconstruction.txt"
+    if template_path.exists():
+        template = template_path.read_text(encoding="utf-8")
+        prompt = template.format(user_text=user_text)
+    else:
+        prompt = (
+            "请将以下用户偏好拆解为四个维度，并仅返回 JSON 对象：\n"
+            '{"semantic": [...], "emotional": [...], "stagecraft": [...], "songs": [...]}。\n'
+            "要求：\n"
+            "- 每个维度最多 3 条短语；\n"
+            "- 只提取文本中明确出现的意图，不要臆造；\n"
+            "- 若某维度缺失，返回空数组；\n"
+            "用户文本：\n"
+            f"{user_text}\n"
+        )
+    try:
+        raw = generator.llm.chat(
+            [
+                {"role": "system", "content": "你是偏好语义解析器，只返回JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_tokens=220,
+        ).strip()
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start < 0 or end < 0 or end <= start:
+            return _rule_based_semantic_dimensions(user_text)
+        obj = json.loads(raw[start:end + 1])
+        out = {"semantic": [], "emotional": [], "stagecraft": [], "songs": []}
+        for key in out:
+            vals = obj.get(key, [])
+            if isinstance(vals, list):
+                out[key] = [str(v).strip() for v in vals if str(v).strip()][:3]
+        return out
+    except Exception:
+        return _rule_based_semantic_dimensions(user_text)
 
 
 def _format_evidence_quotes(fallback_evidence: list[str]) -> str:
@@ -508,7 +592,41 @@ def _format_recommendation_reply(
     lines.append("我先提取到你的偏好：")
     lines.append(f"- 喜欢：{', '.join(likes) if likes else '未识别到明确剧名'}")
     lines.append(f"- 不喜欢/避雷：{', '.join(dislikes) if dislikes else '未识别到明确剧名'}")
+    dims = user.get("meta", {}).get("semantic_dimensions", {}) if isinstance(user.get("meta", {}), dict) else {}
+    if dims:
+        lines.append(
+            "- 语义维度："
+            f"语义={', '.join(dims.get('semantic', [])) or '无'}；"
+            f"情感={', '.join(dims.get('emotional', [])) or '无'}；"
+            f"舞美={', '.join(dims.get('stagecraft', [])) or '无'}；"
+            f"歌曲={', '.join(dims.get('songs', [])) or '无'}"
+        )
     lines.append("")
+    route_hits = retrieved.get("semantic_route_hits", {}) if isinstance(retrieved, dict) else {}
+    if route_hits:
+        lines.append("多路检索命中（每路 Top 命中）：")
+        for channel_key, channel_label in (
+            ("positive", "正向库"),
+            ("negative", "负向库"),
+            ("kb", "知识库"),
+        ):
+            channel = route_hits.get(channel_key, {})
+            if not isinstance(channel, dict) or not channel:
+                continue
+            lines.append(f"- {channel_label}:")
+            for route_name, hits in channel.items():
+                if not hits:
+                    lines.append(f"  - {route_name}: 无命中")
+                    continue
+                short = " | ".join(
+                    [
+                        f"{h.get('item', '未知')}({h.get('score', 0.0):.3f})"
+                        for h in hits[:2]
+                    ]
+                )
+                lines.append(f"  - {route_name}: {short}")
+        lines.append("")
+
     lines.append("已根据你的描述生成推荐（已加入全局质量权重重排）：")
 
     evidence_bank = _build_evidence_bank(retrieved)
@@ -538,6 +656,10 @@ def _format_recommendation_reply(
         neg_ratio = rec.get("_prior_neg_ratio", 0.0)
         user_term = rec.get("_user_term", 0.0)
         dislike_penalty = rec.get("_dislike_hit_penalty", 0.0)
+        base_rank = rec.get("_base_rank_score", 0.0)
+        prior_score = rec.get("_prior_score", 0.0)
+        semantic_alignment = rec.get("_semantic_alignment", 0.0)
+        semantic_bonus = rec.get("_semantic_alignment_bonus", 0.0)
         lines.append(f"{idx}. {musical}")
         lines.append(f"   推荐理由：{reason}")
         lines.append(f"   真实评论证据：{evidence}")
@@ -550,7 +672,7 @@ def _format_recommendation_reply(
                 f"   风险证据来源：negative_evidence_source={negative_evidence_source}, negative_matched_count={negative_matched_count}"
             )
         lines.append(
-            f"   打分分解：quality={quality:.2f}, mentions={mentions}, neg_ratio={neg_ratio:.2f}, user_term={user_term:.2f}, dislike_penalty={dislike_penalty:.2f}, final={rec.get('_rerank_score', 0.0):.2f}"
+            f"   打分分解：base_rank={base_rank:.2f}, prior_score={prior_score:.2f}, quality={quality:.2f}, mentions={mentions}, neg_ratio={neg_ratio:.2f}, user_term={user_term:.2f}, dislike_penalty={dislike_penalty:.2f}, semantic_alignment={semantic_alignment:.2f}, semantic_bonus={semantic_bonus:.2f}, final={rec.get('_rerank_score', 0.0):.2f}"
         )
 
     return "\n".join(lines)
@@ -578,6 +700,7 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
         global_negative_bank,
     ) = RESOURCES
     user = _build_demo_user_from_text(text, allowed_names)
+    user["meta"]["semantic_dimensions"] = _llm_semantic_dimensions(generator, text)
     top_k = config["retrieval"]["default_top_k"]
     kb_top_m = config["retrieval"]["kb_top_m"]
     prior_cfg = config.get("post_rank", {}).get("global_prior", {})
@@ -589,7 +712,7 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
             method="dense",
             top_k=top_k,
             kb_top_m=kb_top_m,
-            exclude_user=False,
+            exclude_user=True,
         )
         output = generator.generate(user, retrieved, signal="dual_enhanced")
         output["recommendations"] = rerank_with_global_priors(
@@ -604,6 +727,9 @@ def chat_recommend(message: str, history: list[tuple[str, str]]):
             user_dislike_map=user_dislike_map,
             lambda_like=float(prior_cfg.get("lambda_like", 1.0)),
             lambda_dislike=float(prior_cfg.get("lambda_dislike", 1.2)),
+            semantic_alignment_weight=float(prior_cfg.get("semantic_alignment_weight", 0.35)),
+            semantic_route_weights=prior_cfg.get("semantic_route_weights"),
+            semantic_channel_weights=prior_cfg.get("semantic_channel_weights"),
             attach_debug_fields=True,
         )
         output["recommendations"] = output.get("recommendations", [])[:final_top_n]

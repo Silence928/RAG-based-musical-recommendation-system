@@ -112,6 +112,26 @@ def format_user_profile(meta: dict) -> str:
     ]
     return "\n".join(lines)
 
+
+def format_semantic_dimensions(meta: dict) -> str:
+    """
+    Optional deconstructed semantic intent from user input.
+    """
+    dims = (meta or {}).get("semantic_dimensions", {}) if isinstance(meta, dict) else {}
+    if not isinstance(dims, dict) or not dims:
+        return "(none)"
+    parts = []
+    for key, label in (
+        ("semantic", "语义维度"),
+        ("emotional", "情感维度"),
+        ("stagecraft", "舞美维度"),
+        ("songs", "歌曲维度"),
+    ):
+        vals = dims.get(key, [])
+        if isinstance(vals, list) and vals:
+            parts.append(f"- {label}: {', '.join([str(v) for v in vals if str(v).strip()])}")
+    return "\n".join(parts) if parts else "(none)"
+
 # ======================== Generator ========================
 
 class MeloGenerator:
@@ -169,6 +189,7 @@ class MeloGenerator:
         kwargs["user_likes"] = format_preferences(user.get("likes", []))
         kwargs["user_dislikes"] = format_preferences(user.get("dislikes", []))
         kwargs["user_profile_summary"] = format_user_profile(user.get("meta", {}))
+        kwargs["semantic_dimensions"] = format_semantic_dimensions(user.get("meta", {}))
         kwargs["retrieved_positive"] = format_retrieved(retrieved.get("positive_pairs", []))
         kwargs["retrieved_negative"] = format_retrieved(retrieved.get("negative_pairs", []))
         kwargs["kb_context"] = format_kb(retrieved.get("kb_entries", []))
